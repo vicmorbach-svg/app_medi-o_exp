@@ -137,8 +137,8 @@ def gerar_excel_medicao(dados: dict) -> Path:
     wb = openpyxl.load_workbook(output_path)
 
     # Nome exato das abas conforme o arquivo modelo
-    NOME_PROTOCOLO = "02-26 PROTOCOLO"
-    NOME_BOLETIM   = "02-26 BOLETIM"
+    NOME_PROTOCOLO = "PROTOCOLO"
+    NOME_BOLETIM   = "BOLETIM"
 
     # ══════════════════════════════════════════════════════════
     # ABA PROTOCOLO
