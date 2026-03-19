@@ -1,413 +1,510 @@
 import streamlit as st
 import pandas as pd
+from datetime import date
 from pathlib import Path
-from datetime import date, datetime
+import hashlib # Para hash de senhas (segurança básica)
+import shutil # Para copiar o arquivo modelo
+import openpyxl # Para manipular o Excel
+import io # Para manipular arquivos em memória
 
-from config import CONTRATOS_FILE, MEDICOES_FILE
-from excel_writer import gerar_excel_medicao, extrair_mes_do_periodo
-from pdf_converter import gerar_pdfs_medicao
+# ── Configurações de diretórios ───────────────────────────────────────────────
+BASE_DIR = Path(__file__).parent
+DADOS_DIR = BASE_DIR / "dados"
+MODELO_DIR = BASE_DIR / "modelo"
+OUTPUT_DIR = BASE_DIR / "output"
 
-st.set_page_config(
-    page_title="Medição de Serviços",
-    page_icon="📋",
-    layout="wide"
-)
+for d in [DADOS_DIR, OUTPUT_DIR]:
+    d.mkdir(exist_ok=True)
 
-# ──────────────────────────────────────────────────────────────────────────────
-# HELPERS
-# ──────────────────────────────────────────────────────────────────────────────
+CONTRATOS_FILE = DADOS_DIR / "contratos.xlsx"
+MEDICOES_FILE  = DADOS_DIR / "medicoes.xlsx"
+MODELO_FILE    = MODELO_DIR / "Modelo_medio.xlsx" # Seu modelo com as abas renomeadas e aba DADOS
 
-def fmt_brl(v: float) -> str:
-    return f"R$ {v:,.2f}".replace(",", "X").replace(".", ",").replace("X", ".")
+# ── Funções de utilidade ─────────────────────────────────────────────────────
+def fmt_brl(value):
+    return f"R$ {value:,.2f}".replace(",", "X").replace(".", ",").replace("X", ".")
 
-def to_date(val):
-    if isinstance(val, date):
-        return val
-    if isinstance(val, datetime):
-        return val.date()
+def to_date(value):
+    if pd.isna(value):
+        return None
+    if isinstance(value, date):
+        return value
     try:
-        return pd.to_datetime(val).date()
-    except Exception:
+        return pd.to_datetime(value).date()
+    except:
         return None
 
-def carregar_contratos() -> pd.DataFrame:
-    if CONTRATOS_FILE.exists():
-        return pd.read_excel(CONTRATOS_FILE)
-    df = pd.DataFrame([{
-        "contrato":             "4600072112",
-        "empresa":              "4C DIGITAL",
-        "local":                "Rua da Assembléia, nº 10, sala 3318, Rio de Janeiro",
-        "modalidade":           "Unitário",
-        "data_base":            "2024-08-29",
-        "data_termino":         "2025-08-29",
-        "valor_original":       1864800.00,
-        "item_num":             20,
-        "und":                  "un",
-        "quant_total":          1864800,
-        "preco_unitario":       1.00,
-        "centro_custo":         "GBC1131003",
-        "conta_contabil":       "",
-        "item_caixa":           "",
-        "servicos_disponiveis": "ENVIO DE SMS;SV DE COBRANÇA",
-    }])
-    df.to_excel(CONTRATOS_FILE, index=False)
-    return df
+def extrair_mes_do_periodo(periodo: str) -> str:
+    MESES_PT = {
+        1: "JANEIRO",  2: "FEVEREIRO", 3: "MARÇO",    4: "ABRIL",
+        5: "MAIO",     6: "JUNHO",     7: "JULHO",     8: "AGOSTO",
+        9: "SETEMBRO", 10: "OUTUBRO",  11: "NOVEMBRO", 12: "DEZEMBRO"
+    }
+    try:
+        partes = periodo.upper().strip().split("A")
+        data_fim = partes[-1].strip()
+        segmentos = data_fim.replace("-", "/").split("/")
+        if len(segmentos) >= 3:
+            mes = int(segments[1])
+            ano = segments[2][:4]
+            return f"{MESES_PT.get(mes, '')} {ano}"
+        elif len(segments) == 2:
+            mes = int(segments[1])
+            return MESES_PT.get(mes, "")
+    except Exception:
+        pass
+    return ""
 
-def carregar_medicoes() -> pd.DataFrame:
+# ── Funções de carregamento/salvamento de dados ──────────────────────────────
+@st.cache_data
+def carregar_contratos():
+    if CONTRATOS_FILE.exists():
+        df = pd.read_excel(CONTRATOS_FILE)
+        if 'fornecedor' not in df.columns:
+            df['fornecedor'] = ''
+        return df
+    return pd.DataFrame(columns=[
+        "contrato", "empresa", "local", "modalidade", "data_base",
+        "data_termino", "valor_original", "item_num", "und",
+        "quant_total", "preco_unitario", "centro_custo",
+        "conta_contabil", "item_caixa", "servicos_disponiveis", "fornecedor"
+    ])
+
+@st.cache_data
+def carregar_medicoes():
     if MEDICOES_FILE.exists():
         return pd.read_excel(MEDICOES_FILE)
-    df = pd.DataFrame(columns=[
-        "contrato", "num_medicao", "data_apresentacao", "periodo",
-        "mes_execucao", "descricao_servico",
-        "quant_mes", "valor_mes",
-        "quant_acum_ant", "valor_acum_ant",
-        "quant_acum_total", "valor_acum_total",
-        "valor_original", "saldo_contrato"
+    return pd.DataFrame(columns=[
+        "contrato", "num_medicao", "empresa", "local", "modalidade",
+        "data_base", "data_termino", "periodo", "mes_execucao",
+        "data_apresentacao", "descricao_servico", "item_num", "und",
+        "quant_total", "preco_unitario", "quant_mes", "valor_mes",
+        "quant_acum_ant", "valor_acum_ant", "quant_acum_total",
+        "valor_acum_total", "valor_original", "saldo_contrato",
+        "centro_custo", "conta_contabil", "item_caixa"
     ])
-    df.to_excel(MEDICOES_FILE, index=False)
-    return df
 
 def salvar_medicoes(df: pd.DataFrame):
     df.to_excel(MEDICOES_FILE, index=False)
+    carregar_medicoes.clear() # Limpa cache para recarregar
 
-def calcular_acumulado(df: pd.DataFrame, contrato: str, num_medicao: int):
-    ant = df[
-        (df["contrato"].astype(str) == str(contrato)) &
-        (df["num_medicao"].astype(int) < num_medicao)
+def calcular_acumulado(df_medicoes_filtrado, contrato_sel, num_medicao_atual):
+    medicoes_anteriores = df_medicoes_filtrado[
+        (df_medicoes_filtrado["contrato"].astype(str) == str(contrato_sel)) &
+        (df_medicoes_filtrado["num_medicao"].astype(int) < int(num_medicao_atual))
     ]
-    if ant.empty:
-        return 0.0, 0.0
-    ultima = ant.sort_values("num_medicao").iloc[-1]
-    return float(ultima["quant_acum_total"]), float(ultima["valor_acum_total"])
+    quant_acum_ant = medicoes_anteriores["quant_mes"].sum()
+    valor_acum_ant = medicoes_anteriores["valor_mes"].sum()
+    return quant_acum_ant, valor_acum_ant
 
-def montar_historico(df: pd.DataFrame, contrato: str,
-                     num_medicao_atual: int, valor_atual: float) -> list:
-    """Retorna lista de todos os boletins (anteriores + atual) para o bloco amarelo."""
-    anteriores = df[
-        (df["contrato"].astype(str) == str(contrato)) &
-        (df["num_medicao"].astype(int) < num_medicao_atual)
-    ].sort_values("num_medicao")
+# ── Funções de geração de Excel (nova abordagem) ─────────────────────────────
+def gerar_excel_com_dados(df_medicoes_fornecedor: pd.DataFrame, contrato_selecionado: str, num_medicao_selecionada: int) -> io.BytesIO:
+    """
+    Copia o Modelo_medio.xlsx, preenche a aba DADOS com as medições do fornecedor
+    e define as células de controle na aba PROTOCOLO para a medição selecionada.
+    Retorna o arquivo Excel em memória (BytesIO).
+    """
+    if not MODELO_FILE.exists():
+        st.error(f"Arquivo modelo não encontrado em: {MODELO_FILE}")
+        st.stop()
 
-    hist = []
-    for _, r in anteriores.iterrows():
-        hist.append({
-            "label": f"Boletim de Medição n. {int(r['num_medicao']):02d} SMS",
-            "valor": float(r["valor_mes"])
-        })
-    hist.append({
-        "label": f"Boletim de Medição n. {num_medicao_atual:02d} SMS",
-        "valor": valor_atual
-    })
-    return hist
+    # Copia o modelo para um buffer em memória
+    template_buffer = io.BytesIO(MODELO_FILE.read_bytes())
+    wb = openpyxl.load_workbook(template_buffer)
 
-# ──────────────────────────────────────────────────────────────────────────────
-# ESTADO DA SESSÃO
-# ──────────────────────────────────────────────────────────────────────────────
-
-for key, default in [
-    ("excel_path", None),
-    ("pdf_paths", {}),
-    ("dados_gerados", None),
-]:
-    if key not in st.session_state:
-        st.session_state[key] = default
-
-# ──────────────────────────────────────────────────────────────────────────────
-# CARREGA DADOS
-# ──────────────────────────────────────────────────────────────────────────────
-
-df_contratos = carregar_contratos()
-df_medicoes  = carregar_medicoes()
-
-# ──────────────────────────────────────────────────────────────────────────────
-# SIDEBAR
-# ──────────────────────────────────────────────────────────────────────────────
-
-with st.sidebar:
-    st.header("📊 Histórico de Medições")
-    if not df_medicoes.empty:
-        st.dataframe(
-            df_medicoes[[
-                "contrato", "num_medicao", "periodo",
-                "valor_mes", "valor_acum_total", "saldo_contrato"
-            ]].sort_values(["contrato", "num_medicao"]),
-            use_container_width=True
-        )
+    # Preenche a aba DADOS
+    if "DADOS" not in wb.sheetnames:
+        ws_dados = wb.create_sheet("DADOS")
     else:
-        st.info("Nenhuma medição registrada ainda.")
+        ws_dados = wb["DADOS"]
+        # Limpa conteúdo existente na aba DADOS (exceto cabeçalho)
+        if ws_dados.max_row > 1:
+            ws_dados.delete_rows(2, ws_dados.max_row - 1)
+
+    # Escreve o cabeçalho (se a aba DADOS estava vazia ou foi limpa)
+    if ws_dados.max_row < 1 or ws_dados['A1'].value is None:
+        for col_idx, col_name in enumerate(df_medicoes_fornecedor.columns, 1):
+            ws_dados.cell(row=1, column=col_idx, value=col_name)
+
+    # Escreve os dados
+    # Começa da linha 2 (abaixo do cabeçalho)
+    for r_idx, row_data in df_medicoes_fornecedor.iterrows():
+        for c_idx, value in enumerate(row_data, 1):
+            ws_dados.cell(row=r_idx + 2, column=c_idx, value=value) # +2 porque linha 1 é cabeçalho, linha 2 é a primeira linha de dados
+
+    # Define as células de controle na aba PROTOCOLO para a medição selecionada
+    # Assumindo que B9 é o contrato e B5 é o num_medicao
+    # E que as abas foram renomeadas para "PROTOCOLO" e "BOLETIM"
+    if "PROTOCOLO" in wb.sheetnames:
+        ws_protocolo = wb["PROTOCOLO"]
+        ws_protocolo["B9"] = contrato_selecionado # Define o contrato para as fórmulas buscarem
+        ws_protocolo["B5"] = num_medicao_selecionada # Define o num_medicao para as fórmulas buscarem
+    else:
+        st.warning("Aba 'PROTOCOLO' não encontrada no modelo. Verifique o nome da aba.")
+
+    if "BOLETIM" in wb.sheetnames:
+        # A aba BOLETIM geralmente referencia PROTOCOLO, então não precisa de ajuste direto aqui
+        pass
+    else:
+        st.warning("Aba 'BOLETIM' não encontrada no modelo. Verifique o nome da aba.")
+
+    # Salva o workbook em um buffer em memória
+    output_buffer = io.BytesIO()
+    wb.save(output_buffer)
+    output_buffer.seek(0) # Volta para o início do buffer
+    return output_buffer
+
+# ── Autenticação (usando st.secrets) ─────────────────────────────────────────
+def autenticar(username, password):
+    if "usuarios" not in st.secrets:
+        st.error("Configuração de usuários não encontrada em `secrets.toml`.")
+        return False
+
+    usuarios_secrets = st.secrets["usuarios"]
+    hashed_password = hashlib.sha256(password.encode()).hexdigest()
+
+    for user_data in usuarios_secrets:
+        if user_data["usuario"] == username and hashlib.sha256(user_data["senha"].encode()).hexdigest() == hashed_password:
+            st.session_state.logged_in = True
+            st.session_state.username = username
+            st.session_state.fornecedor = user_data["fornecedor"]
+            st.session_state.is_admin = user_data.get("is_admin", False) # Pega o status de admin
+            return True
+    return False
+
+def logout():
+    st.session_state.logged_in = False
+    st.session_state.username = None
+    st.session_state.fornecedor = None
+    st.session_state.is_admin = False
+    st.rerun()
+
+# ── Inicialização do estado da sessão ────────────────────────────────────────
+if "logged_in" not in st.session_state:
+    st.session_state.logged_in = False
+if "excel_buffer" not in st.session_state: # Armazena o buffer do Excel gerado
+    st.session_state.excel_buffer = None
+if "excel_filename" not in st.session_state: # Armazena o nome do arquivo Excel gerado
+    st.session_state.excel_filename = None
+if "dados_gerados" not in st.session_state:
+    st.session_state.dados_gerados = None
+if "is_admin" not in st.session_state:
+    st.session_state.is_admin = False
+
+# ── Interface do Streamlit ───────────────────────────────────────────────────
+st.set_page_config(layout="wide", page_title="App de Medição CORSAN")
+
+if not st.session_state.logged_in:
+    st.title("Login - App de Medição CORSAN")
+    username = st.text_input("Usuário")
+    password = st.text_input("Senha", type="password")
+    if st.button("Entrar"):
+        if autenticar(username, password):
+            st.success(f"Bem-vindo, {st.session_state.username} ({st.session_state.fornecedor})!")
+            st.rerun()
+        else:
+            st.error("Usuário ou senha incorretos.")
+else:
+    st.sidebar.title(f"Bem-vindo, {st.session_state.username}")
+    st.sidebar.write(f"Fornecedor: **{st.session_state.fornecedor}**")
+    if st.session_state.is_admin:
+        st.sidebar.info("Você é um usuário administrador.")
+    if st.sidebar.button("Sair"):
+        logout()
+
+    st.title("App de Medição CORSAN")
+
+    # Carrega dados
+    df_contratos = carregar_contratos()
+    df_medicoes = carregar_medicoes()
+
+    # Filtra dados pelo fornecedor logado
+    df_contratos_fornecedor = df_contratos[
+        df_contratos["fornecedor"] == st.session_state.fornecedor
+    ].copy()
+    df_medicoes_fornecedor = df_medicoes[
+        df_medicoes["empresa"] == st.session_state.fornecedor # Assumindo que 'empresa' em medicoes.xlsx é o fornecedor
+    ].copy()
+
+    if df_contratos_fornecedor.empty:
+        st.warning(f"Nenhum contrato encontrado para o fornecedor '{st.session_state.fornecedor}'. Verifique o arquivo 'contratos.xlsx'.")
+        st.stop()
+
+    # ──────────────────────────────────────────────────────────────────────────────
+    # 1. CONTRATO
+    # ──────────────────────────────────────────────────────────────────────────────
+    st.subheader("1. Seleção do Contrato")
+
+    contratos_disp = df_contratos_fornecedor["contrato"].unique()
+    contrato_sel = st.selectbox(
+        "Selecione o Contrato",
+        options=contratos_disp,
+        format_func=lambda x: f"{x} - {df_contratos_fornecedor[df_contratos_fornecedor['contrato'] == x]['empresa'].iloc[0]}"
+    )
+
+    if not contrato_sel:
+        st.info("Selecione um contrato para continuar.")
+        st.stop()
+
+    cr = df_contratos_fornecedor[df_contratos_fornecedor["contrato"] == contrato_sel].iloc[0]
+
+    st.json(cr.to_dict()) # Exibe os detalhes do contrato selecionado
 
     st.divider()
-    if st.button("🔄 Recarregar dados"):
-        st.rerun()
 
-# ──────────────────────────────────────────────────────────────────────────────
-# TÍTULO
-# ──────────────────────────────────────────────────────────────────────────────
+    # ──────────────────────────────────────────────────────────────────────────────
+    # 2. DADOS DA MEDIÇÃO
+    # ──────────────────────────────────────────────────────────────────────────────
+    st.subheader("2. Dados da Medição")
 
-st.title("📋 Medição de Serviços")
-st.divider()
+    col1, col2, col3 = st.columns([1, 2, 2])
 
-# ──────────────────────────────────────────────────────────────────────────────
-# 1. CONTRATO
-# ──────────────────────────────────────────────────────────────────────────────
+    with col1:
+        # Sugere o próximo número de medição
+        ult_medicao = df_medicoes_fornecedor[
+            df_medicoes_fornecedor["contrato"].astype(str) == str(contrato_sel)
+        ]["num_medicao"].max()
+        prox_num_medicao = (ult_medicao + 1) if pd.notna(ult_medicao) else 1
+        num_medicao = st.number_input("Nº do Boletim", min_value=1, step=1, value=int(prox_num_medicao))
 
-st.subheader("1. Contrato")
+    with col2:
+        periodo = st.text_input(
+            "Período",
+            placeholder="01/02/2026 A 28/02/2026",
+            help="Formato: DD/MM/AAAA A DD/MM/AAAA"
+        )
 
-contrato_sel = st.selectbox(
-    "Selecione o contrato",
-    df_contratos["contrato"].astype(str).unique()
-)
-cr = df_contratos[
-    df_contratos["contrato"].astype(str) == contrato_sel
-].iloc[0]
+    with col3:
+        data_apresentacao = st.date_input("Data de apresentação", value=date.today())
 
-c1, c2, c3, c4 = st.columns(4)
-c1.metric("Empresa",        cr["empresa"])
-c2.metric("Modalidade",     cr["modalidade"])
-c3.metric("Valor Original", fmt_brl(float(cr["valor_original"])))
-c4.metric("Centro Custo",   cr["centro_custo"])
+    mes_execucao = extrair_mes_do_periodo(periodo) if periodo else ""
 
-with st.expander("Ver todos os dados do contrato"):
+    if mes_execucao:
+        st.success(f"Mês de execução: **{mes_execucao}**")
+    elif periodo:
+        st.warning("Não foi possível extrair o mês. Verifique o formato do período.")
+
+    st.divider()
+
+    # ──────────────────────────────────────────────────────────────────────────────
+    # 3. SERVIÇO E QUANTIDADE
+    # ──────────────────────────────────────────────────────────────────────────────
+    st.subheader("3. Serviço e Quantidade")
+
+    servicos_lista = [
+        s.strip()
+        for s in str(cr.get("servicos_disponiveis", "")).split(";")
+        if s.strip()
+    ] or ["ENVIO DE SMS"]
+
     col1, col2 = st.columns(2)
-    col1.write(f"**Local:** {cr['local']}")
-    col1.write(f"**Data Base:** {cr['data_base']}")
-    col1.write(f"**Término:** {cr['data_termino']}")
-    col2.write(f"**Item:** {cr['item_num']} — {cr['und']}")
-    col2.write(f"**Quant. Total:** {int(cr['quant_total']):,}".replace(",", "."))
-    col2.write(f"**P.U.:** {fmt_brl(float(cr['preco_unitario']))}")
-    col2.write(f"**Conta Contábil:** {cr['conta_contabil']}")
 
-st.divider()
+    with col1:
+        descricao_servico = st.selectbox("Descrição do serviço (A7)", servicos_lista)
 
-# ──────────────────────────────────────────────────────────────────────────────
-# 2. DADOS DA MEDIÇÃO
-# ──────────────────────────────────────────────────────────────────────────────
+    with col2:
+        quant_mes = st.number_input(
+            f"Quantidade medida no mês ({cr['und']})",
+            min_value=0.0, step=0.01, value=0.0, format="%.2f"
+        )
 
-st.subheader("2. Dados da Medição")
+    # ── Cálculos ─────────────────────────────────────────────────────────────────
+    valor_original   = float(cr["valor_original"])
+    preco_unitario   = float(cr["preco_unitario"])
 
-col1, col2, col3 = st.columns([1, 2, 2])
-
-with col1:
-    num_medicao = st.number_input("Nº do Boletim", min_value=1, step=1, value=1)
-
-with col2:
-    periodo = st.text_input(
-        "Período",
-        placeholder="01/02/2026 A 28/02/2026",
-        help="Formato: DD/MM/AAAA A DD/MM/AAAA"
+    quant_acum_ant, valor_acum_ant = calcular_acumulado(
+        df_medicoes_fornecedor, contrato_sel, num_medicao
     )
 
-with col3:
-    data_apresentacao = st.date_input("Data de apresentação", value=date.today())
+    valor_mes        = quant_mes * preco_unitario
+    quant_acum_total = quant_acum_ant + quant_mes
+    valor_acum_total = valor_acum_ant + valor_mes
+    saldo_contrato   = valor_original - valor_acum_total
 
-# Mês extraído automaticamente
-mes_execucao = extrair_mes_do_periodo(periodo) if periodo else ""
+    st.divider()
 
-if mes_execucao:
-    st.success(f"Mês de execução: **{mes_execucao}**")
-elif periodo:
-    st.warning("Não foi possível extrair o mês. Verifique o formato do período.")
+    # ──────────────────────────────────────────────────────────────────────────────
+    # 4. RESUMO
+    # ──────────────────────────────────────────────────────────────────────────────
+    st.subheader("4. Resumo da Medição")
 
-st.divider()
+    c1, c2, c3, c4 = st.columns(4)
+    c1.metric("Acum. Anterior",   fmt_brl(valor_acum_ant))
+    c2.metric("Valor do Mês",     fmt_brl(valor_mes))
+    c3.metric("Acum. Total",      fmt_brl(valor_acum_total))
+    c4.metric("Saldo do Contrato", fmt_brl(saldo_contrato))
 
-# ──────────────────────────────────────────────────────────────────────────────
-# 3. SERVIÇO E QUANTIDADE
-# ──────────────────────────────────────────────────────────────────────────────
-
-st.subheader("3. Serviço e Quantidade")
-
-servicos_lista = [
-    s.strip()
-    for s in str(cr.get("servicos_disponiveis", "")).split(";")
-    if s.strip()
-] or ["ENVIO DE SMS"]
-
-col1, col2 = st.columns(2)
-
-with col1:
-    descricao_servico = st.selectbox("Descrição do serviço (A7)", servicos_lista)
-
-with col2:
-    quant_mes = st.number_input(
-        f"Quantidade medida no mês ({cr['und']})",
-        min_value=0.0, step=0.01, value=0.0, format="%.2f"
+    pct = (valor_acum_total / valor_original * 100) if valor_original > 0 else 0
+    st.progress(
+        min(pct / 100, 1.0),
+        text=f"Execução contratual: {pct:.1f}%"
     )
 
-# ── Cálculos ─────────────────────────────────────────────────────────────────
+    st.divider()
 
-valor_original   = float(cr["valor_original"])
-preco_unitario   = float(cr["preco_unitario"])
+    # ──────────────────────────────────────────────────────────────────────────────
+    # 5. GERAR E SALVAR ARQUIVOS
+    # ──────────────────────────────────────────────────────────────────────────────
+    st.subheader("5. Gerar e Salvar Arquivos")
 
-quant_acum_ant, valor_acum_ant = calcular_acumulado(
-    df_medicoes, contrato_sel, num_medicao
-)
+    campos_ok = bool(periodo and mes_execucao and quant_mes >= 0) # quant_mes pode ser 0 para medições sem quantidade no mês
 
-valor_mes        = quant_mes * preco_unitario
-quant_acum_total = quant_acum_ant + quant_mes
-valor_acum_total = valor_acum_ant + valor_mes
-saldo_contrato   = valor_original - valor_acum_total
+    if not campos_ok:
+        st.info("Preencha o período e a quantidade para habilitar a geração.")
 
-st.divider()
+    if st.button("💾 Salvar Medição e Gerar Excel", type="primary",
+                 use_container_width=True, disabled=not campos_ok):
 
-# ──────────────────────────────────────────────────────────────────────────────
-# 4. RESUMO
-# ──────────────────────────────────────────────────────────────────────────────
+        dados_medicao = {
+            "contrato":           contrato_sel,
+            "num_medicao":        num_medicao,
+            "periodo":            periodo,
+            "data_apresentacao":  data_apresentacao,
+            "descricao_servico":  descricao_servico,
+            "valor_mes":          valor_mes,
+            "quant_mes":          quant_mes,
+            "empresa":            cr["empresa"], # Empresa do contrato, que é o fornecedor logado
+            "local":              cr["local"],
+            "modalidade":         cr["modalidade"],
+            "data_base":          to_date(cr["data_base"]),
+            "data_termino":       to_date(cr["data_termino"]),
+            "valor_original":     valor_original,
+            "item_num":           cr["item_num"],
+            "und":                cr["und"],
+            "quant_total":        float(cr["quant_total"]),
+            "preco_unitario":     preco_unitario,
+            "centro_custo":       str(cr.get("centro_custo", "")),
+            "conta_contabil":     str(cr.get("conta_contabil", "")),
+            "item_caixa":         str(cr.get("item_caixa", "")),
+            "quant_acum_ant":     quant_acum_ant,
+            "valor_acum_ant":     valor_acum_ant,
+            "quant_acum_total":   quant_acum_total,
+            "valor_acum_total":   valor_acum_total,
+            "saldo_contrato":     saldo_contrato,
+        }
 
-st.subheader("4. Resumo da Medição")
+        # 1. Salvar a medição na base de dados geral (medicoes.xlsx)
+        with st.spinner("Salvando medição..."):
+            try:
+                # Remove duplicata se existir
+                mask = ~(
+                    (df_medicoes["contrato"].astype(str) == str(contrato_sel)) &
+                    (df_medicoes["num_medicao"].astype(int) == int(num_medicao))
+                )
+                df_medicoes_atualizado = df_medicoes[mask]
 
-c1, c2, c3, c4 = st.columns(4)
-c1.metric("Acum. Anterior",   fmt_brl(valor_acum_ant))
-c2.metric("Valor do Mês",     fmt_brl(valor_mes))
-c3.metric("Acum. Total",      fmt_brl(valor_acum_total))
-c4.metric("Saldo do Contrato", fmt_brl(saldo_contrato))
+                novo_registro_df = pd.DataFrame([dados_medicao])
+                df_medicoes_atualizado = pd.concat(
+                    [df_medicoes_atualizado, novo_registro_df],
+                    ignore_index=True
+                )
+                salvar_medicoes(df_medicoes_atualizado)
+                st.success("Medição salva com sucesso na base de dados!")
+                st.session_state.dados_gerados = dados_medicao # Armazena para download
+            except Exception as e:
+                st.error(f"Erro ao salvar medição: {e}")
+                st.stop()
 
-pct = (valor_acum_total / valor_original * 100) if valor_original > 0 else 0
-st.progress(
-    min(pct / 100, 1.0),
-    text=f"Execução contratual: {pct:.1f}%"
-)
+        # 2. Gerar o Excel final com os dados do fornecedor e a medição selecionada
+        with st.spinner("Gerando Excel final com dados do fornecedor..."):
+            try:
+                # Recarrega as medições para incluir a recém-salva
+                df_medicoes_atualizado_fornecedor = carregar_medicoes()[
+                    carregar_medicoes()["empresa"] == st.session_state.fornecedor
+                ].copy()
 
-st.divider()
+                excel_buffer = gerar_excel_com_dados(
+                    df_medicoes_atualizado_fornecedor,
+                    contrato_sel,
+                    num_medicao
+                )
 
-# ──────────────────────────────────────────────────────────────────────────────
-# 5. GERAR ARQUIVOS
-# ──────────────────────────────────────────────────────────────────────────────
-
-st.subheader("5. Gerar Arquivos")
-
-campos_ok = bool(periodo and mes_execucao and quant_mes > 0)
-
-if not campos_ok:
-    st.info("Preencha o período e a quantidade para habilitar a geração.")
-
-if st.button("⚙️ Gerar Excel + PDF", type="primary",
-             use_container_width=True, disabled=not campos_ok):
-
-    historico = montar_historico(
-        df_medicoes, contrato_sel, num_medicao, valor_mes
-    )
-
-    dados_medicao = {
-        "contrato":           contrato_sel,
-        "num_medicao":        num_medicao,
-        "periodo":            periodo,
-        "data_apresentacao":  data_apresentacao,
-        "descricao_servico":  descricao_servico,
-        "valor_mes":          valor_mes,
-        "quant_mes":          quant_mes,
-        "empresa":            cr["empresa"],
-        "local":              cr["local"],
-        "modalidade":         cr["modalidade"],
-        "data_base":          to_date(cr["data_base"]),
-        "data_termino":       to_date(cr["data_termino"]),
-        "valor_original":     valor_original,
-        "item_num":           cr["item_num"],
-        "und":                cr["und"],
-        "quant_total":        float(cr["quant_total"]),
-        "preco_unitario":     preco_unitario,
-        "centro_custo":       str(cr.get("centro_custo", "")),
-        "conta_contabil":     str(cr.get("conta_contabil", "")),
-        "item_caixa":         str(cr.get("item_caixa", "")),
-        "quant_acum_ant":     quant_acum_ant,
-        "valor_acum_ant":     valor_acum_ant,
-        "quant_acum_total":   quant_acum_total,
-        "valor_acum_total":   valor_acum_total,
-        "saldo_contrato":     saldo_contrato,
-        "historico":          historico,
-    }
-
-    with st.spinner("Gerando Excel..."):
-        try:
-            excel_path = gerar_excel_medicao(dados_medicao)
-            st.session_state.excel_path   = excel_path
-            st.session_state.dados_gerados = dados_medicao
-            st.success(f"Excel gerado: `{excel_path.name}`")
-        except Exception as e:
-            st.error(f"Erro ao gerar Excel: {e}")
-            st.stop()
-
-    with st.spinner("Convertendo para PDF..."):
-        try:
-            pdfs = gerar_pdfs_medicao(excel_path)
-            st.session_state.pdf_paths = pdfs
-            st.success("PDFs gerados!")
-        except Exception as e:
-            st.warning(f"PDF não gerado automaticamente: {e}")
-            st.session_state.pdf_paths = {}
+                # Nome do arquivo PDF: 'fornecedor' + 'nome da aba' + 'serviço' + 'mês'
+                # Assumindo que a aba principal é "PROTOCOLO"
+                nome_pdf = (
+                    f"{st.session_state.fornecedor.replace(' ', '_')}_"
+                    f"PROTOCOLO_{descricao_servico.replace(' ', '_')}_"
+                    f"{mes_execucao.replace(' ', '_')}.xlsx" # Ainda é um Excel, mas com nome de PDF
+                )
+                st.session_state.excel_buffer = excel_buffer
+                st.session_state.excel_filename = nome_pdf
+                st.success(f"Excel final gerado: `{nome_pdf}`")
+            except Exception as e:
+                st.error(f"Erro ao gerar Excel final: {e}")
+                st.stop()
 
 # ──────────────────────────────────────────────────────────────────────────────
 # 6. DOWNLOADS
 # ──────────────────────────────────────────────────────────────────────────────
+    if st.session_state.excel_buffer:
+        st.divider()
+        st.subheader("6. Downloads")
 
-if st.session_state.excel_path and Path(st.session_state.excel_path).exists():
-    st.divider()
-    st.subheader("6. Downloads")
+        col1, col2 = st.columns(2)
 
-    c1, c2, c3 = st.columns(3)
+        col1.download_button(
+            "📥 Baixar Excel da Medição (Modelo Preenchido)",
+            data=st.session_state.excel_buffer,
+            file_name=st.session_state.excel_filename,
+            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+            use_container_width=True
+        )
 
-    c1.download_button(
-        "📥 Baixar Excel",
-        data=Path(st.session_state.excel_path).read_bytes(),
-        file_name=Path(st.session_state.excel_path).name,
-        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-        use_container_width=True
-    )
+        col1.info("Para gerar o PDF, abra o arquivo Excel baixado e use a função 'Salvar como PDF' do próprio Excel.")
 
-    for aba, col in [("PROTOCOLO", c2), ("BOLETIM", c3)]:
-        if aba in st.session_state.pdf_paths:
-            p = Path(st.session_state.pdf_paths[aba])
-            if p.exists():
-                col.download_button(
-                    f"📄 PDF — {aba}",
-                    data=p.read_bytes(),
-                    file_name=p.name,
-                    mime="application/pdf",
-                    use_container_width=True
-                )
+        # Opcional: permitir baixar a base de medicoes.xlsx completa do fornecedor
+        df_medicoes_fornecedor_download = carregar_medicoes()[
+            carregar_medicoes()["empresa"] == st.session_state.fornecedor
+        ].copy()
 
-# ──────────────────────────────────────────────────────────────────────────────
-# 7. SALVAR MEDIÇÃO
-# ──────────────────────────────────────────────────────────────────────────────
+        excel_buffer_medicoes = io.BytesIO()
+        df_medicoes_fornecedor_download.to_excel(excel_buffer_medicoes, index=False, engine="openpyxl")
+        excel_buffer_medicoes.seek(0)
 
-    st.divider()
-    st.subheader("7. Confirmar e Salvar")
+        col2.download_button(
+            "📥 Baixar Base de Medições do Fornecedor (medicoes.xlsx)",
+            data=excel_buffer_medicoes,
+            file_name=f"medicoes_{st.session_state.fornecedor.replace(' ', '_')}.xlsx",
+            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+            use_container_width=True
+        )
 
-    st.warning(
-        "⚠️ Confira o Excel antes de salvar. "
-        "Esta ação registra a medição no histórico."
-    )
+    # ──────────────────────────────────────────────────────────────────────────────
+    # 7. EXCLUSÃO DE LANÇAMENTOS (APENAS ADMIN)
+    # ──────────────────────────────────────────────────────────────────────────────
+    if st.session_state.is_admin:
+        st.divider()
+        st.subheader("7. Excluir Lançamento (Apenas Admin)")
+        st.warning("Esta funcionalidade é apenas para administradores e remove dados permanentemente.")
 
-    if st.button("💾 Salvar medição", use_container_width=True, type="primary"):
-        d = st.session_state.dados_gerados
-        if d:
-            # Remove duplicata se existir
-            mask = ~(
-                (df_medicoes["contrato"].astype(str) == str(contrato_sel)) &
-                (df_medicoes["num_medicao"].astype(int) == int(num_medicao))
+        # Exibe as medições do fornecedor logado para seleção
+        if not df_medicoes_fornecedor.empty:
+            st.dataframe(df_medicoes_fornecedor.sort_values(by=["contrato", "num_medicao"]), use_container_width=True)
+
+            medicao_para_excluir = st.selectbox(
+                "Selecione a Medição para Excluir",
+                options=df_medicoes_fornecedor.apply(
+                    lambda row: f"Contrato: {row['contrato']} - Boletim: {row['num_medicao']} - Mês: {row['mes_execucao']}",
+                    axis=1
+                ).tolist()
             )
-            df_upd = df_medicoes[mask]
 
-            novo = {
-                "contrato":          d["contrato"],
-                "num_medicao":       d["num_medicao"],
-                "data_apresentacao": str(d["data_apresentacao"]),
-                "periodo":           d["periodo"],
-                "mes_execucao":      mes_execucao,
-                "descricao_servico": d["descricao_servico"],
-                "quant_mes":         d["quant_mes"],
-                "valor_mes":         d["valor_mes"],
-                "quant_acum_ant":    d["quant_acum_ant"],
-                "valor_acum_ant":    d["valor_acum_ant"],
-                "quant_acum_total":  d["quant_acum_total"],
-                "valor_acum_total":  d["valor_acum_total"],
-                "valor_original":    d["valor_original"],
-                "saldo_contrato":    d["saldo_contrato"],
-            }
+            if medicao_para_excluir:
+                # Extrai contrato e num_medicao da string selecionada
+                partes = medicao_para_excluir.split(" - ")
+                contrato_excluir = partes[0].replace("Contrato: ", "")
+                num_medicao_excluir = int(partes[1].replace("Boletim: ", ""))
 
-            df_upd = pd.concat(
-                [df_upd, pd.DataFrame([novo])],
-                ignore_index=True
-            )
-            salvar_medicoes(df_upd)
-            st.success("Medição salva com sucesso!")
-            st.rerun()
+                if st.button(f"🔴 Confirmar Exclusão da Medição {num_medicao_excluir} do Contrato {contrato_excluir}", type="secondary"):
+                    try:
+                        df_medicoes_atualizado = df_medicoes[
+                            ~((df_medicoes["contrato"].astype(str) == contrato_excluir) &
+                              (df_medicoes["num_medicao"].astype(int) == num_medicao_excluir))
+                        ].copy()
+                        salvar_medicoes(df_medicoes_atualizado)
+                        st.success(f"Medição {num_medicao_excluir} do Contrato {contrato_excluir} excluída com sucesso!")
+                        st.rerun() # Recarrega a página para atualizar a lista
+                    except Exception as e:
+                        st.error(f"Erro ao excluir medição: {e}")
+        else:
+            st.info("Não há medições para excluir para este fornecedor.")
