@@ -6,6 +6,7 @@ import hashlib # Para hash de senhas (segurança básica)
 import shutil # Para copiar o arquivo modelo
 import openpyxl # Para manipular o Excel
 import io # Para manipular arquivos em memória
+import json # Para lidar com a string JSON de preços
 
 # ── Configurações de diretórios ───────────────────────────────────────────────
 BASE_DIR = Path(__file__).parent
@@ -62,12 +63,17 @@ def carregar_contratos():
         df = pd.read_excel(CONTRATOS_FILE)
         if 'fornecedor' not in df.columns:
             df['fornecedor'] = ''
+        # Converte a string JSON de precos_servicos para um dicionário
+        if 'precos_servicos' in df.columns:
+            df['precos_servicos'] = df['precos_servicos'].apply(lambda x: json.loads(x) if pd.notna(x) else {})
+        else:
+            df['precos_servicos'] = {} # Garante que a coluna exista
         return df
     return pd.DataFrame(columns=[
         "contrato", "empresa", "local", "modalidade", "data_base",
         "data_termino", "valor_original", "item_num", "und",
-        "quant_total", "preco_unitario", "centro_custo",
-        "conta_contabil", "item_caixa", "servicos_disponiveis", "fornecedor"
+        "quant_total", "servicos_disponiveis", "precos_servicos", # Atualizado
+        "centro_custo", "conta_contabil", "item_caixa", "fornecedor"
     ])
 
 @st.cache_data
@@ -78,7 +84,8 @@ def carregar_medicoes():
         "contrato", "num_medicao", "empresa", "local", "modalidade",
         "data_base", "data_termino", "periodo", "mes_execucao",
         "data_apresentacao", "descricao_servico", "item_num", "und",
-        "quant_total", "preco_unitario", "quant_mes", "valor_mes",
+        "quant_total", "preco_unitario", # Manter para compatibilidade com histórico
+        "quant_mes", "valor_mes",
         "quant_acum_ant", "valor_acum_ant", "quant_acum_total",
         "valor_acum_total", "valor_original", "saldo_contrato",
         "centro_custo", "conta_contabil", "item_caixa"
@@ -253,9 +260,28 @@ else:
     st.divider()
 
     # ──────────────────────────────────────────────────────────────────────────────
-    # 2. DADOS DA MEDIÇÃO
+    # 2. TIPO DE SERVIÇO E PREÇO UNITÁRIO
     # ──────────────────────────────────────────────────────────────────────────────
-    st.subheader("2. Dados da Medição")
+    st.subheader("2. Tipo de Serviço e Preço Unitário")
+
+    servicos_precos = cr.get("precos_servicos", {})
+    servicos_lista = list(servicos_precos.keys())
+
+    if not servicos_lista:
+        st.error("Nenhum serviço configurado para este contrato. Verifique 'contratos.xlsx'.")
+        st.stop()
+
+    descricao_servico = st.selectbox("Selecione o Tipo de Serviço", servicos_lista)
+    preco_unitario_selecionado = servicos_precos.get(descricao_servico, 0.0)
+
+    st.info(f"Preço Unitário para '{descricao_servico}': **{fmt_brl(preco_unitario_selecionado)}**")
+
+    st.divider()
+
+    # ──────────────────────────────────────────────────────────────────────────────
+    # 3. DADOS DA MEDIÇÃO
+    # ──────────────────────────────────────────────────────────────────────────────
+    st.subheader("3. Dados da Medição")
 
     col1, col2, col3 = st.columns([1, 2, 2])
 
@@ -287,30 +313,19 @@ else:
     st.divider()
 
     # ──────────────────────────────────────────────────────────────────────────────
-    # 3. SERVIÇO E QUANTIDADE
+    # 4. QUANTIDADE
     # ──────────────────────────────────────────────────────────────────────────────
-    st.subheader("3. Serviço e Quantidade")
+    st.subheader("4. Quantidade Medida")
 
-    servicos_lista = [
-        s.strip()
-        for s in str(cr.get("servicos_disponiveis", "")).split(";")
-        if s.strip()
-    ] or ["ENVIO DE SMS"]
-
-    col1, col2 = st.columns(2)
-
-    with col1:
-        descricao_servico = st.selectbox("Descrição do serviço (A7)", servicos_lista)
-
-    with col2:
-        quant_mes = st.number_input(
-            f"Quantidade medida no mês ({cr['und']})",
-            min_value=0.0, step=0.01, value=0.0, format="%.2f"
-        )
+    quant_mes = st.number_input(
+        f"Quantidade medida no mês ({cr['und']})",
+        min_value=0.0, step=0.01, value=0.0, format="%.2f"
+    )
 
     # ── Cálculos ─────────────────────────────────────────────────────────────────
     valor_original   = float(cr["valor_original"])
-    preco_unitario   = float(cr["preco_unitario"])
+    # preco_unitario agora vem da seleção do serviço
+    preco_unitario   = preco_unitario_selecionado
 
     quant_acum_ant, valor_acum_ant = calcular_acumulado(
         df_medicoes_fornecedor, contrato_sel, num_medicao
@@ -324,9 +339,9 @@ else:
     st.divider()
 
     # ──────────────────────────────────────────────────────────────────────────────
-    # 4. RESUMO
+    # 5. RESUMO
     # ──────────────────────────────────────────────────────────────────────────────
-    st.subheader("4. Resumo da Medição")
+    st.subheader("5. Resumo da Medição")
 
     c1, c2, c3, c4 = st.columns(4)
     c1.metric("Acum. Anterior",   fmt_brl(valor_acum_ant))
@@ -343,14 +358,14 @@ else:
     st.divider()
 
     # ──────────────────────────────────────────────────────────────────────────────
-    # 5. GERAR E SALVAR ARQUIVOS
+    # 6. GERAR E SALVAR ARQUIVOS
     # ──────────────────────────────────────────────────────────────────────────────
-    st.subheader("5. Gerar e Salvar Arquivos")
+    st.subheader("6. Gerar e Salvar Arquivos")
 
-    campos_ok = bool(periodo and mes_execucao and quant_mes >= 0) # quant_mes pode ser 0 para medições sem quantidade no mês
+    campos_ok = bool(periodo and mes_execucao and quant_mes >= 0 and descricao_servico)
 
     if not campos_ok:
-        st.info("Preencha o período e a quantidade para habilitar a geração.")
+        st.info("Preencha todos os campos obrigatórios para habilitar a geração.")
 
     if st.button("💾 Salvar Medição e Gerar Excel", type="primary",
                  use_container_width=True, disabled=not campos_ok):
@@ -372,7 +387,7 @@ else:
             "item_num":           cr["item_num"],
             "und":                cr["und"],
             "quant_total":        float(cr["quant_total"]),
-            "preco_unitario":     preco_unitario,
+            "preco_unitario":     preco_unitario, # Agora é o preço do serviço selecionado
             "centro_custo":       str(cr.get("centro_custo", "")),
             "conta_contabil":     str(cr.get("conta_contabil", "")),
             "item_caixa":         str(cr.get("item_caixa", "")),
@@ -421,24 +436,24 @@ else:
 
                 # Nome do arquivo PDF: 'fornecedor' + 'nome da aba' + 'serviço' + 'mês'
                 # Assumindo que a aba principal é "PROTOCOLO"
-                nome_pdf = (
+                nome_excel_final = (
                     f"{st.session_state.fornecedor.replace(' ', '_')}_"
                     f"PROTOCOLO_{descricao_servico.replace(' ', '_')}_"
-                    f"{mes_execucao.replace(' ', '_')}.xlsx" # Ainda é um Excel, mas com nome de PDF
+                    f"{mes_execucao.replace(' ', '_')}.xlsx"
                 )
                 st.session_state.excel_buffer = excel_buffer
-                st.session_state.excel_filename = nome_pdf
-                st.success(f"Excel final gerado: `{nome_pdf}`")
+                st.session_state.excel_filename = nome_excel_final
+                st.success(f"Excel final gerado: `{nome_excel_final}`")
             except Exception as e:
                 st.error(f"Erro ao gerar Excel final: {e}")
                 st.stop()
 
 # ──────────────────────────────────────────────────────────────────────────────
-# 6. DOWNLOADS
+# 7. DOWNLOADS
 # ──────────────────────────────────────────────────────────────────────────────
     if st.session_state.excel_buffer:
         st.divider()
-        st.subheader("6. Downloads")
+        st.subheader("7. Downloads")
 
         col1, col2 = st.columns(2)
 
@@ -470,11 +485,11 @@ else:
         )
 
     # ──────────────────────────────────────────────────────────────────────────────
-    # 7. EXCLUSÃO DE LANÇAMENTOS (APENAS ADMIN)
+    # 8. EXCLUSÃO DE LANÇAMENTOS (APENAS ADMIN)
     # ──────────────────────────────────────────────────────────────────────────────
     if st.session_state.is_admin:
         st.divider()
-        st.subheader("7. Excluir Lançamento (Apenas Admin)")
+        st.subheader("8. Excluir Lançamento (Apenas Admin)")
         st.warning("Esta funcionalidade é apenas para administradores e remove dados permanentemente.")
 
         # Exibe as medições do fornecedor logado para seleção
@@ -484,7 +499,7 @@ else:
             medicao_para_excluir = st.selectbox(
                 "Selecione a Medição para Excluir",
                 options=df_medicoes_fornecedor.apply(
-                    lambda row: f"Contrato: {row['contrato']} - Boletim: {row['num_medicao']} - Mês: {row['mes_execucao']}",
+                    lambda row: f"Contrato: {row['contrato']} - Boletim: {row['num_medicao']} - Serviço: {row['descricao_servico']} - Mês: {row['mes_execucao']}",
                     axis=1
                 ).tolist()
             )
@@ -494,15 +509,17 @@ else:
                 partes = medicao_para_excluir.split(" - ")
                 contrato_excluir = partes[0].replace("Contrato: ", "")
                 num_medicao_excluir = int(partes[1].replace("Boletim: ", ""))
+                descricao_servico_excluir = partes[2].replace("Serviço: ", "")
 
-                if st.button(f"🔴 Confirmar Exclusão da Medição {num_medicao_excluir} do Contrato {contrato_excluir}", type="secondary"):
+                if st.button(f"🔴 Confirmar Exclusão da Medição {num_medicao_excluir} do Contrato {contrato_excluir} ({descricao_servico_excluir})", type="secondary"):
                     try:
                         df_medicoes_atualizado = df_medicoes[
                             ~((df_medicoes["contrato"].astype(str) == contrato_excluir) &
-                              (df_medicoes["num_medicao"].astype(int) == num_medicao_excluir))
+                              (df_medicoes["num_medicao"].astype(int) == num_medicao_excluir) &
+                              (df_medicoes["descricao_servico"].astype(str) == descricao_servico_excluir)) # Adiciona serviço para desambiguar
                         ].copy()
                         salvar_medicoes(df_medicoes_atualizado)
-                        st.success(f"Medição {num_medicao_excluir} do Contrato {contrato_excluir} excluída com sucesso!")
+                        st.success(f"Medição {num_medicao_excluir} do Contrato {contrato_excluir} ({descricao_servico_excluir}) excluída com sucesso!")
                         st.rerun() # Recarrega a página para atualizar a lista
                     except Exception as e:
                         st.error(f"Erro ao excluir medição: {e}")
