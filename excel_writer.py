@@ -46,25 +46,9 @@ def _w(ws, cell_coord: str, value):
     """
     Escreve valor na célula SEM alterar nenhuma formatação existente.
     Preserva fonte, borda, preenchimento, alinhamento e formato numérico.
-    Verifica se a célula é a superior esquerda de uma mesclagem antes de escrever.
+    Assume que 'cell_coord' é a célula superior esquerda de qualquer mesclagem relevante.
     """
-    # Converte a coordenada da célula para linha e coluna numéricas
-    col_num, row_num = openpyxl.utils.cell.column_index_from_string(cell_coord.rstrip('0123456789')), int(cell_coord.lstrip('ABCDEFGHIJKLMNOPQRSTUVWXYZ'))
-
-    # Verifica se a célula faz parte de uma área mesclada
-    is_merged_cell = False
-    for merged_range in ws.merged_cells:
-        min_col, min_row, max_col, max_row = openpyxl.utils.cell.range_boundaries(merged_range)
-        if min_row <= row_num <= max_row and min_col <= col_num <= max_col:
-            is_merged_cell = True
-            # Se for uma célula mesclada, só escreve se for a célula superior esquerda
-            if row_num == min_row and col_num == min_col:
-                ws[cell_coord].value = value
-            return # Já tratou ou decidiu não escrever, sai da função
-
-    # Se não for uma célula mesclada, escreve normalmente
-    if not is_merged_cell:
-        ws[cell_coord].value = value
+    ws[cell_coord].value = value
 
 
 def _wn(ws, row: int, col: int, value):
@@ -137,8 +121,8 @@ def gerar_excel_medicao(dados: dict) -> Path:
     wb = openpyxl.load_workbook(output_path)
 
     # Nome exato das abas conforme o arquivo modelo
-    NOME_PROTOCOLO = "PROTOCOLO"
-    NOME_BOLETIM   = "BOLETIM"
+    NOME_PROTOCOLO = "02-26 PROTOCOLO"
+    NOME_BOLETIM   = "02-26 BOLETIM"
 
     # ══════════════════════════════════════════════════════════
     # ABA PROTOCOLO
